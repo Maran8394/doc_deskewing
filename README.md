@@ -38,7 +38,20 @@ Path("invoice_deskewed.png").write_bytes(encode_png(result.enhanced_image))
 - An image file as bytes
 - A single-page PDF as bytes
 
-If the detected angle is within the skew threshold, the package does not rotate the page.
+If the detected angle is within the skew threshold (default is **1.0 degree**), the package skips rotation and text enhancement, returning the original image to preserve quality.
+
+### DeskewResult Attributes
+
+When you call `deskew_image`, it returns a `DeskewResult` object with the following fields:
+
+| Attribute | Type | Description |
+| :--- | :--- | :--- |
+| `original_angle` | `float` | The detected skew angle of the input document. |
+| `rotated_angle` | `float` | The detected angle after correction (should be near 0.0). |
+| `applied_rotation` | `float` | The actual rotation applied (0.0 if not skewed). |
+| `skewed` | `bool` | `True` if the `abs(original_angle)` exceeded the 1.0° threshold. |
+| `corrected_image` | `ndarray` | The image after rotation and cropping (original if not skewed). |
+| `enhanced_image` | `ndarray` | The binarized/cleaned image ready for OCR (original if not skewed). |
 
 Bulk usage:
 

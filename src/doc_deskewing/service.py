@@ -371,16 +371,16 @@ def deskew_image_bytes(image: np.ndarray) -> DeskewResult:
     applied_rotation, _, _ = search_best_fast_rotation(image)
     original_angle = applied_rotation if applied_rotation != 0.0 else coarse_angle
     skewed = is_skewed(original_angle)
+    applied_rotation = applied_rotation if skewed else 0.0
 
     if skewed:
         corrected = rotate_image(image, applied_rotation)
         rotated_angle = detect_tilt_angle_fast(corrected)
+        enhanced = enhance_text(corrected)
     else:
-        applied_rotation = 0.0
-        corrected = crop_to_content(image)
-        rotated_angle = detect_tilt_angle_fast(corrected)
-
-    enhanced = enhance_text(corrected)
+        corrected = image
+        rotated_angle = original_angle
+        enhanced = image
 
     logger.info(
         "Fast deskew result: skewed=%s original_angle=%.4f applied_rotation=%.4f rotated_angle=%.4f",
