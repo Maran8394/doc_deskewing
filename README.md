@@ -5,14 +5,14 @@ Internal pip package for document deskewing.
 ## Install From Git
 
 ```bash
-pip install "git+ssh://git@your-git-host/your-org/doc_deskewing.git"
+pip install "git@github.com:Maran8394/doc_deskewing.git"
 ```
 
 Or pin a branch / tag:
 
 ```bash
-pip install "git+ssh://git@your-git-host/your-org/doc_deskewing.git@main"
-pip install "git+ssh://git@your-git-host/your-org/doc_deskewing.git@v1.0.0"
+pip install "git@github.com:Maran8394/doc_deskewing.git@main"
+pip install "git@github.com:Maran8394/doc_deskewing.git@v1.0.0"
 ```
 
 For local development:
