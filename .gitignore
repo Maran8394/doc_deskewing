@@ -1,2 +1,14 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
 venv/
 .env
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+
+# Outputs
+*.pdf

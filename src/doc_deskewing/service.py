@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import io
+import json
 import logging
 import re
+import zipfile
 from dataclasses import dataclass
 from typing import Final
 
 import cv2
+import fitz
 import numpy as np
 from skimage.color import rgb2gray
 from skimage.feature import canny
@@ -18,7 +22,8 @@ FAST_DETECTION_MAX_DIMENSION: Final[int] = 1200
 FAST_SAFE_SKEW_LIMIT: Final[float] = 15.0
 FAST_SEARCH_STEP: Final[float] = 0.5
 FAST_MIN_SCORE_IMPROVEMENT_RATIO: Final[float] = 1.01
-logger = logging.getLogger("uvicorn.error")
+PDF_RENDER_DPI: Final[int] = 200
+logger = logging.getLogger("doc_deskewing")
 
 
 class ImageProcessingError(Exception):
@@ -35,6 +40,10 @@ class ImageTooLargeError(ImageProcessingError):
 
 class ImageEncodingError(ImageProcessingError):
     """Raised when the processed image cannot be encoded for response."""
+
+
+class InvalidDocumentError(ImageProcessingError):
+    """Raised when the input document type is unsupported or malformed."""
 
 
 @dataclass(slots=True)
@@ -54,6 +63,15 @@ class BulkDeskewItem:
     result: DeskewResult
 
 
+@dataclass(slots=True)
+class CompiledDocument:
+    original_filename: str
+    output_filename: str
+    content_bytes: bytes
+    media_type: str
+    items: list[BulkDeskewItem]
+
+
 def validate_image_size(image_bytes: bytes, max_bytes: int = MAX_IMAGE_BYTES) -> None:
     if not image_bytes:
         raise InvalidImageError("Uploaded file is empty.")
@@ -61,6 +79,72 @@ def validate_image_size(image_bytes: bytes, max_bytes: int = MAX_IMAGE_BYTES) ->
         raise ImageTooLargeError(
             f"Uploaded file exceeds the {max_bytes // (1024 * 1024)}MB limit."
         )
+
+
+def is_pdf_bytes(document_bytes: bytes) -> bool:
+    return document_bytes[:5] == b"%PDF-"
+
+
+def decode_pdf_page(pdf_bytes: bytes, page_index: int = 0, dpi: int = PDF_RENDER_DPI) -> np.ndarray:
+    try:
+        pdf = fitz.open(stream=pdf_bytes, filetype="pdf")
+    except Exception as exc:
+        raise InvalidDocumentError("Failed to open PDF document.") from exc
+
+    with pdf:
+        if pdf.page_count == 0:
+            raise InvalidDocumentError("PDF document has no pages.")
+        if page_index < 0 or page_index >= pdf.page_count:
+            raise InvalidDocumentError(f"PDF page index {page_index} is out of range.")
+
+        page = pdf.load_page(page_index)
+        scale = dpi / 72.0
+        matrix = fitz.Matrix(scale, scale)
+        pixmap = page.get_pixmap(matrix=matrix, alpha=False)
+
+    buffer = np.frombuffer(pixmap.samples, dtype=np.uint8)
+    image = buffer.reshape(pixmap.height, pixmap.width, pixmap.n)
+    if pixmap.n == 4:
+        image = image[:, :, :3]
+    return image.copy()
+
+
+def get_pdf_page_count(pdf_bytes: bytes) -> int:
+    try:
+        pdf = fitz.open(stream=pdf_bytes, filetype="pdf")
+    except Exception as exc:
+        raise InvalidDocumentError("Failed to open PDF document.") from exc
+
+    with pdf:
+        if pdf.page_count == 0:
+            raise InvalidDocumentError("PDF document has no pages.")
+        return pdf.page_count
+
+
+def decode_pdf_pages(pdf_bytes: bytes, dpi: int = PDF_RENDER_DPI) -> list[np.ndarray]:
+    try:
+        pdf = fitz.open(stream=pdf_bytes, filetype="pdf")
+    except Exception as exc:
+        raise InvalidDocumentError("Failed to open PDF document.") from exc
+
+    pages: list[np.ndarray] = []
+    with pdf:
+        if pdf.page_count == 0:
+            raise InvalidDocumentError("PDF document has no pages.")
+
+        scale = dpi / 72.0
+        matrix = fitz.Matrix(scale, scale)
+
+        for page_index in range(pdf.page_count):
+            page = pdf.load_page(page_index)
+            pixmap = page.get_pixmap(matrix=matrix, alpha=False)
+            buffer = np.frombuffer(pixmap.samples, dtype=np.uint8)
+            image = buffer.reshape(pixmap.height, pixmap.width, pixmap.n)
+            if pixmap.n == 4:
+                image = image[:, :, :3]
+            pages.append(image.copy())
+
+    return pages
 
 
 def decode_image(image_bytes: bytes) -> np.ndarray:
@@ -73,6 +157,20 @@ def decode_image(image_bytes: bytes) -> np.ndarray:
         raise InvalidImageError("Failed to decode uploaded image.")
 
     return cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+
+
+def decode_document(document_bytes: bytes) -> np.ndarray:
+    validate_image_size(document_bytes)
+    if is_pdf_bytes(document_bytes):
+        return decode_pdf_page(document_bytes, page_index=0)
+    return decode_image(document_bytes)
+
+
+def decode_document_pages(document_bytes: bytes) -> list[np.ndarray]:
+    validate_image_size(document_bytes)
+    if is_pdf_bytes(document_bytes):
+        return decode_pdf_pages(document_bytes)
+    return [decode_image(document_bytes)]
 
 
 def crop_to_content(image: np.ndarray) -> np.ndarray:
@@ -268,42 +366,7 @@ def search_best_fast_rotation(
     return best_rotation, zero_rotation_score, best_text_score
 
 
-def process_document(image_bytes: bytes) -> DeskewResult:
-    image = decode_image(image_bytes)
-    binary_image = binarize_image(image)
-    image_edges = find_edges(binary_image)
-    original_angle = find_tilt_angle(image_edges)
-    skewed = is_skewed(original_angle)
-    applied_rotation = original_angle if skewed else 0.0
-    corrected = (
-        rotate_image(image, applied_rotation) if skewed else crop_to_content(image)
-    )
-    corrected_binary_image = binarize_image(corrected)
-    corrected_edges = find_edges(corrected_binary_image)
-    rotated_angle = find_tilt_angle(corrected_edges)
-
-    enhanced = enhance_text(corrected)
-
-    logger.info(
-        "Deskew result: skewed=%s original_angle=%.4f applied_rotation=%.4f rotated_angle=%.4f",
-        skewed,
-        original_angle,
-        applied_rotation,
-        rotated_angle,
-    )
-
-    return DeskewResult(
-        original_angle=original_angle,
-        rotated_angle=rotated_angle,
-        applied_rotation=applied_rotation,
-        skewed=skewed,
-        corrected_image=corrected,
-        enhanced_image=enhanced,
-    )
-
-
-def process_document_fast(image_bytes: bytes) -> DeskewResult:
-    image = decode_image(image_bytes)
+def deskew_image_bytes(image: np.ndarray) -> DeskewResult:
     coarse_angle = detect_tilt_angle_fast(image)
     applied_rotation, _, _ = search_best_fast_rotation(image)
     original_angle = applied_rotation if applied_rotation != 0.0 else coarse_angle
@@ -337,6 +400,16 @@ def process_document_fast(image_bytes: bytes) -> DeskewResult:
     )
 
 
+def deskew_image(document_bytes: bytes) -> DeskewResult:
+    if is_pdf_bytes(document_bytes) and get_pdf_page_count(document_bytes) != 1:
+        raise InvalidDocumentError(
+            "deskew_image accepts image files or single-page PDFs only."
+        )
+
+    image = decode_document(document_bytes)
+    return deskew_image_bytes(image)
+
+
 def encode_png(image: np.ndarray) -> bytes:
     if image.ndim == 2:
         image_to_encode = image
@@ -357,19 +430,118 @@ def build_output_filename(filename: str, suffix: str = "_deskewed.png") -> str:
     return f"{safe_stem}{suffix}"
 
 
-def process_documents_fast_bulk(
+def build_output_filename_for_page(
+    filename: str,
+    page_number: int,
+    suffix: str = "_page_{page_number}_deskewed.png",
+) -> str:
+    return build_output_filename(filename, suffix=suffix.format(page_number=page_number))
+
+
+def build_output_pdf_filename(filename: str, suffix: str = "_deskewed.pdf") -> str:
+    return build_output_filename(filename, suffix=suffix)
+
+
+def build_pdf_document(items: list[BulkDeskewItem]) -> bytes:
+    pdf = fitz.open()
+
+    try:
+        for item in items:
+            image_bytes = encode_png(item.result.enhanced_image)
+            image_doc = fitz.open(stream=image_bytes, filetype="png")
+            rect = image_doc[0].rect
+            page = pdf.new_page(width=rect.width, height=rect.height)
+            page.insert_image(rect, stream=image_bytes)
+            image_doc.close()
+
+        return pdf.tobytes()
+    finally:
+        pdf.close()
+
+
+def deskew_images_bulk(
     files: list[tuple[str, bytes]],
-) -> list[BulkDeskewItem]:
+    compile_pdf: bool = False,
+) -> list[BulkDeskewItem] | list[CompiledDocument]:
+    if compile_pdf:
+        compiled_documents: list[CompiledDocument] = []
+
+        for original_filename, document_bytes in files:
+            if not is_pdf_bytes(document_bytes):
+                raise InvalidDocumentError(
+                    "compile_pdf=True is supported for PDF inputs only."
+                )
+
+            pages = decode_document_pages(document_bytes)
+            items: list[BulkDeskewItem] = []
+
+            for page_index, page_image in enumerate(pages, start=1):
+                result = deskew_image_bytes(page_image)
+                items.append(
+                    BulkDeskewItem(
+                        original_filename=original_filename,
+                        output_filename=build_output_filename_for_page(
+                            original_filename,
+                            page_index,
+                        ),
+                        result=result,
+                    )
+                )
+
+            compiled_documents.append(
+                CompiledDocument(
+                    original_filename=original_filename,
+                    output_filename=build_output_pdf_filename(original_filename),
+                    content_bytes=build_pdf_document(items),
+                    media_type="application/pdf",
+                    items=items,
+                )
+            )
+
+        return compiled_documents
+
     results: list[BulkDeskewItem] = []
 
-    for original_filename, image_bytes in files:
-        result = process_document_fast(image_bytes)
-        results.append(
-            BulkDeskewItem(
-                original_filename=original_filename,
-                output_filename=build_output_filename(original_filename),
-                result=result,
+    for original_filename, document_bytes in files:
+        pages = decode_document_pages(document_bytes)
+        is_multi_page_pdf = is_pdf_bytes(document_bytes) and len(pages) > 1
+
+        for page_index, page_image in enumerate(pages, start=1):
+            result = deskew_image_bytes(page_image)
+            output_filename = (
+                build_output_filename_for_page(original_filename, page_index)
+                if is_multi_page_pdf
+                else build_output_filename(original_filename)
             )
-        )
+            results.append(
+                BulkDeskewItem(
+                    original_filename=original_filename,
+                    output_filename=output_filename,
+                    result=result,
+                )
+            )
 
     return results
+
+
+def build_bulk_zip(items: list[BulkDeskewItem]) -> bytes:
+    metadata: list[dict[str, str | float | bool]] = []
+    buffer = io.BytesIO()
+
+    with zipfile.ZipFile(buffer, mode="w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for item in items:
+            archive.writestr(item.output_filename, encode_png(item.result.enhanced_image))
+            metadata.append(
+                {
+                    "input_filename": item.original_filename,
+                    "output_filename": item.output_filename,
+                    "original_angle": round(item.result.original_angle, 4),
+                    "rotated_angle": round(item.result.rotated_angle, 4),
+                    "applied_rotation": round(item.result.applied_rotation, 4),
+                    "skew_corrected": item.result.skewed,
+                }
+            )
+
+        archive.writestr("results.json", json.dumps(metadata, indent=2))
+
+    return buffer.getvalue()
